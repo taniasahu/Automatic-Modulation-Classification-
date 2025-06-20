@@ -1,41 +1,43 @@
 %% Usage of MATLAB's Communication Toolbox
 %% MODULATION DATASET GENERATION 
+
 clear; clc; rng(42);  % Reproducible results
 
 % Parameters
 modTypes = ["BPSK","QPSK","8PSK","16QAM","64QAM","GFSK","CPFSK","PAM4","B-FM","DSB-AM","SSB-AM"];
 numModTypes = length(modTypes);
-numFramesPerMod = 5000;
-totalFrames = numFramesPerMod * numModTypes;
+numFramesPerMod = 5000;  
 frameLength = 1024;
 sps = 8;
 fs = 200e3;              % Sampling frequency = 200 kHz
-SNR_range = [-6, 20];    % SNR range
-Kfactor = 4;             % Rician K-factor
-maxOffset = 4;           % Max timing offset in samples
-maxFreqDrift = 200;      % Max freq drift in Hz
-maxPhaseOffset = 0.1;    % Max phase offset in radians
+SNR_range = [-6, 20];    % Range of SNR
+maxOffset = 6;           % max timing offset
+maxFreqDrift = 400;      % max freq drift
+maxPhaseOffset = pi/2;   % Max phase offset
 
 % Channel objects
 ricianChan = comm.RicianChannel(...
     'SampleRate', fs, ...
-    'PathDelays', [0 1.5e-5 3e-5], ...
-    'AveragePathGains', [0 -2 -10], ...
-    'KFactor', Kfactor, ...
+    'PathDelays', [0 1.5e-5 3e-5], ...  % delays
+    'AveragePathGains', [0 -2 -10], ...  % gains
+    'KFactor', 4, ...                    % K-factor
     'MaximumDopplerShift', 1);
+
 rayleighChan = comm.RayleighChannel(...
     'SampleRate', fs, ...
     'PathDelays', [0 1.5e-5 3e-5], ...
     'AveragePathGains', [0 -2 -10], ...
     'MaximumDopplerShift', 1);
 
-% Preallocate arrays
-data = zeros(totalFrames, frameLength, 2); % I/Q
-labels = zeros(totalFrames, 1);            % Numeric labels (1 to 11)
-split = zeros(totalFrames, 1);             % Split encoding: 0=train, 1=val, 2=test
-impairments = zeros(totalFrames, 6);       % [modLabel, channelType, SNR, timingOffset, freqDrift, phaseOffset]
+% Preallocate with full frames
+totalFrames = numFramesPerMod * numModTypes;
+data = zeros(totalFrames, frameLength, 2, 'single'); % I/Q 
+labels = zeros(totalFrames, 1, 'uint8');
+split = zeros(totalFrames, 1, 'uint8');
+impairments = zeros(totalFrames, 6, 'single'); % [modIdx, chanType, SNR, timingOffset, freqDrift, phaseOffset]
 
-% Generate dataset
+% Generate dataset with stratified SNR
+snrBins = -6:2:20;  % Stratify into 2 dB bins
 for frameIdx = 1:totalFrames
     m = ceil(frameIdx / numFramesPerMod);  % Modulation index
     modType = modTypes(m);
@@ -43,119 +45,55 @@ for frameIdx = 1:totalFrames
         fprintf("Generating %s signals...\n", modType);
     end
 
-    % Generate input with buffer for filter delay
-    buffer = 32;  % Buffer to account for filter delay (rrc filter length - 1)
+    % Generate symbols
     if ismember(modType, ["B-FM","DSB-AM","SSB-AM"])
-        x = randn(frameLength + sps - 1 + buffer, 1);
+        x = randn(frameLength + sps*8, 1);  % Longer buffer for analog mods
     else
         M = getModOrder(modType);
-        numSymbols = ceil((frameLength + sps - 1 + buffer)/sps);
+        numSymbols = ceil((frameLength + sps*8)/sps);  % Buffer for pulse shaping
         x = randi([0 M-1], numSymbols, 1);
     end
 
-    % Modulate
+    % Modulate with RRC filter
     modulator = helperModClassGetModulator(modType, sps, fs);
     y = modulator(x);
-    y = y(:) / (max(abs(y)) + eps);  % Amplitude normalization
+    y = y / (max(abs(y)) + eps);  % Normalization
 
-    % Apply timing offset
-    timingOffset = randi([-maxOffset, maxOffset]);
-    y = circshift(y, timingOffset);
-
-    % Apply fading
-    channelType = randi([0 1]);  % 0: Rayleigh, 1: Rician
-    if channelType == 1
-        y = ricianChan(y);  % Apply Rician fading
-    else
-        y = rayleighChan(y);  % Apply Rayleigh fading
-    end
-
-    % Frequency drift and phase offset
-    t = (0:length(y)-1)'/fs;
-    fDrift = maxFreqDrift * (2*rand - 1);
-    phaseOffset = maxPhaseOffset * (2*rand - 1);
-    y = y .* exp(1j * (2*pi*fDrift*t + phaseOffset));
-
-    % Add AWGN
-    snrThisFrame = SNR_range(1) + (SNR_range(2)-SNR_range(1))*rand();
-    y = awgn(y, snrThisFrame, 'measured');
-
-    % Frame extraction
-    startIdx = randi([1, sps]);
-    endIdx = startIdx + frameLength - 1;
-    if endIdx > length(y)
-        y = [y; zeros(endIdx - length(y), 1)];  % Pad with zeros if necessary
-    end
-    frame = y(startIdx : endIdx) / sqrt(mean(abs(y).^2) + eps);
-
-    % Normalize Power
-        frame = frame / sqrt(mean(abs(frame).^2) + eps);
-
-    % Store data
-    data(frameIdx, :, 1) = real(frame);
-    data(frameIdx, :, 2) = imag(frame);
-    labels(frameIdx) = m;
-    impairments(frameIdx, :) = [m, channelType, snrThisFrame, timingOffset, fDrift, phaseOffset];
-end
-
-%% USE ONLY IF APPLYING A UNIT CLASSIFIER INTO YOUR MODEL, used for simplification
-% Pre-segment data into units (128 samples with 64 overlap)
-segmentSize = 128;
-overlap = 64;
-segmentedData = zeros(totalFrames * floor((frameLength - overlap) / (segmentSize - overlap)), segmentSize, 2);
-segmentedLabels = zeros(size(segmentedData, 1), 1);
-segmentedImpairments = zeros(size(segmentedData, 1), 6);
-idx = 1;
-for frameIdx = 1:totalFrames
-    frame = squeeze(data(frameIdx, :, :));
-    numSegments = floor((length(frame) - overlap) / (segmentSize - overlap));
-    for seg = 1:numSegments
-        startIdx = (seg-1) * (segmentSize - overlap) + 1;
-        endIdx = startIdx + segmentSize - 1;
-        segmentedData(idx, :, :) = frame(startIdx:endIdx, :);
-        segmentedLabels(idx) = labels(frameIdx);
-        segmentedImpairments(idx, :) = impairments(frameIdx, :);
-        idx = idx + 1;
-    end
-end
-data = segmentedData;
-labels = segmentedLabels;
-impairments = segmentedImpairments;
-totalFrames = size(data, 1);
-
-% Stratified split based on SNR
-snrValues = impairments(:, 3);
-snrBins = -6:4:20;
-splitProportions = [0.7 0.15 0.15];  % Train: 70%, Val: 15%, Test: 15%
-
-for i = 1:length(snrBins)-1
-    binMask = (snrValues >= snrBins(i)) & (snrValues < snrBins(i+1));
-    binIndices = find(binMask);
-    numBinSamples = length(binIndices);
+    % Apply impairments
+    [y, timingOffset, freqDrift, phaseOffset] = applyImpairments(y, fs, maxOffset, maxFreqDrift);
     
-    if numBinSamples > 0
-        perm = randperm(numBinSamples);
-        binIndices = binIndices(perm);
-        
-        numTrain = floor(splitProportions(1) * numBinSamples);
-        numVal = floor(splitProportions(2) * numBinSamples);
-        
-        split(binIndices(1:numTrain)) = 0;  % Train
-        split(binIndices(numTrain+1:numTrain+numVal)) = 1;  % Val
-        split(binIndices(numTrain+numVal+1:end)) = 2;  % Test
+    % Apply fading 
+    channelType = randi([0 1]);
+    if channelType == 1
+        y = ricianChan(y);  % Rician fading
+    else
+        y = rayleighChan(y); % Rayleigh fading
     end
+    reset(ricianChan);  % Reset both channels
+    reset(rayleighChan);
+    
+    % Assign SNR from stratified bins
+    binIdx = mod(floor((frameIdx-1) / (totalFrames/length(snrBins))), length(snrBins)-1) + 1;
+    snrThisFrame = snrBins(binIdx) + (snrBins(binIdx+1) - snrBins(binIdx)) * rand();
+    y = awgn(y, snrThisFrame, 'measured');
+    
+    % Power normalization
+    y = y / sqrt(mean(abs(y).^2));
+    
+    % Store full frame
+    data(frameIdx, :, 1) = real(y(1:frameLength));
+    data(frameIdx, :, 2) = imag(y(1:frameLength));
+    labels(frameIdx) = m;
+    impairments(frameIdx, :) = [m, channelType, snrThisFrame, timingOffset, freqDrift, phaseOffset];
 end
+
+% stratified split (70/15/15)
+snrValues = impairments(:, 3);
+split = stratifySplit(snrValues, [-6:4:20], [0.7, 0.15, 0.15]);
 
 % Save dataset
 save('AMC_dataset.mat', 'data', 'labels', 'split', 'impairments', 'modTypes', 'fs', '-v7');
-
-% Verify dataset
-fileInfo = dir('AMC_dataset.mat');
-fprintf('Dataset saved. Size: %.2f MB\n', fileInfo.bytes/(1024^2));
-test = load('AMC_dataset.mat');
-fprintf('Loaded dataset with %d samples\n', size(test.data, 1));
-fprintf('Impairments matrix size: %d x %d\n', size(test.impairments));
-disp("Dataset Generated");
+fprintf('Dataset saved with %d frames\n', size(data,1));
 
 % Helper functions
 function M = getModOrder(modType)
@@ -168,6 +106,36 @@ function M = getModOrder(modType)
         case "PAM4", M = 4;
         case {"GFSK", "CPFSK"}, M = 2;
         otherwise, M = [];
+    end
+end
+
+function [y, timingOffset, freqDrift, phaseOffset] = applyImpairments(y, fs, maxOffset, maxFreqDrift)
+    % Timing offset 
+    timingOffset = randi([-maxOffset, maxOffset]);
+    y = circshift(y, timingOffset);
+    
+    % Frequency drift 
+    freqDrift = maxFreqDrift * (2*rand - 1);
+    t = (0:length(y)-1)'/fs;
+    phaseOffset = 2*pi*rand(); % Random phase
+    y = y .* exp(1j * (2*pi*freqDrift*t + phaseOffset));
+end
+
+function split = stratifySplit(snrValues, snrBins, proportions)
+    split = zeros(size(snrValues), 'uint8');
+    for i = 1:length(snrBins)-1
+        binMask = (snrValues >= snrBins(i)) & (snrValues < snrBins(i+1));
+        binIndices = find(binMask);
+        if ~isempty(binIndices)
+            numBin = length(binIndices);
+            randOrder = randperm(numBin);
+            trainEnd = round(proportions(1)*numBin);
+            valEnd = trainEnd + round(proportions(2)*numBin);
+            
+            split(binIndices(randOrder(1:trainEnd))) = 0; % Train
+            split(binIndices(randOrder(trainEnd+1:valEnd))) = 1; % Val
+            split(binIndices(randOrder(valEnd+1:end))) = 2; % Test
+        end
     end
 end
 
