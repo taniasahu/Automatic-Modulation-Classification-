@@ -1,0 +1,206 @@
+%% Use of MATLAB's Communication Toolbox
+%% MODULATION DATSET GENERATION
+% Updated below to work better with SNN-based model requirements
+
+clear; clc; rng(42);  % Reproducible results
+
+% Parameters
+modTypes = ["BPSK","QPSK","8PSK","16QAM","64QAM","GFSK","CPFSK","PAM4","B-FM","DSB-AM","SSB-AM"];
+numModTypes = length(modTypes);
+numFramesPerMod = 10000;  
+frameLength = 512;
+sps = 8;
+fs = 200e3;              % Sampling frequency = 200 kHz
+SNR_range = [-10, 28];   % SNR range
+maxOffset = 6;           % Max timing offset
+maxFreqDrift = 400;      % Max freq drift
+maxPhaseOffset = pi/2;   % Max phase offset
+grid_size = 36;          % Grid size for polar projection
+T = 2;                   % Number of time steps
+
+% Channel objects
+ricianChan = comm.RicianChannel(...
+    'SampleRate', fs, ...
+    'PathDelays', [0 1.5e-5 3e-5], ...  % Delays
+    'AveragePathGains', [0 -2 -10], ...  % Gains
+    'KFactor', 4, ...                    % K-factor
+    'MaximumDopplerShift', 1);
+
+rayleighChan = comm.RayleighChannel(...
+    'SampleRate', fs, ...
+    'PathDelays', [0 1.5e-5 3e-5], ...
+    'AveragePathGains', [0 -2 -10], ...
+    'MaximumDopplerShift', 1);
+
+% Preallocate with full frames
+totalFrames = numFramesPerMod * numModTypes;
+data = zeros(totalFrames, frameLength, 2, 'single'); % I/Q (single precision)
+pixel_pics = zeros(totalFrames, T, grid_size, grid_size, 'single'); % Precomputed grid images
+labels = zeros(totalFrames, 1, 'uint8');
+split = zeros(totalFrames, 1, 'uint8');
+impairments = zeros(totalFrames, 6, 'single'); % [modIdx, chanType, SNR, timingOffset, freqDrift, phaseOffset]
+
+% Generate dataset with stratified SNR
+snrBins = -10:2:28;  % Stratify into 2 dB bins
+for frameIdx = 1:totalFrames
+    m = ceil(frameIdx / numFramesPerMod);  % Modulation index
+    modType = modTypes(m);
+    if mod(frameIdx, numFramesPerMod) == 1
+        fprintf("Generating %s signals...\n", modType);
+    end
+
+    % Generate symbols
+    if ismember(modType, ["B-FM","DSB-AM","SSB-AM"])
+        x = randn(frameLength + sps*8, 1);  % Longer buffer for analog mods
+    else
+        M = getModOrder(modType);
+        numSymbols = ceil((frameLength + sps*8)/sps);  % Buffer for pulse shaping
+        x = randi([0 M-1], numSymbols, 1);
+    end
+
+    % Modulate with RRC filter (β=0.35, span=4)
+    modulator = helperModClassGetModulator(modType, sps, fs);
+    y = modulator(x);
+    y = y / (max(abs(y)) + eps);  % Normalization
+
+    % Apply impairments
+    [y, timingOffset, freqDrift, phaseOffset] = applyImpairments(y, fs, maxOffset, maxFreqDrift);
+    
+    % Apply fading 
+    channelType = randi([0 1]);
+    if channelType == 1
+        y = ricianChan(y);  % Rician fading
+    else
+        y = rayleighChan(y); % Rayleigh fading
+    end
+    reset(ricianChan);  % Reset both channels
+    reset(rayleighChan);
+    
+    % Assign SNR from stratified bins
+    binIdx = mod(floor((frameIdx-1) / (totalFrames/length(snrBins))), length(snrBins)-1) + 1;
+    snrThisFrame = snrBins(binIdx) + (snrBins(binIdx+1) - snrBins(binIdx)) * rand();
+    y = awgn(y, snrThisFrame, 'measured');
+    
+    % Power normalization
+    y = y / sqrt(mean(abs(y).^2));
+    
+    % Store full frame
+    data(frameIdx, :, 1) = real(y(1:frameLength));
+    data(frameIdx, :, 2) = imag(y(1:frameLength));
+    
+    % Signal Processing: I/Q to Polar -> Grid -> Temporal
+    I = real(y(1:frameLength)); Q = imag(y(1:frameLength));
+    r = sqrt(I.^2 + Q.^2);
+    theta = atan2(Q, I);
+    r_min = min(r); r_max = max(r);
+    theta_min = min(theta); theta_max = max(theta);
+    g_r = (r_max - r_min) / grid_size; if g_r == 0, g_r = 1; end
+    g_theta = (theta_max - theta_min) / grid_size; if g_theta == 0, g_theta = 1; end
+    x = floor((r - r_min) / g_r); x = min(max(x, 0), grid_size-1);
+    y = floor((theta - theta_min) / g_theta); y = min(max(y, 0), grid_size-1);
+    P = zeros(T, grid_size, grid_size, 'single');
+    segment_size = frameLength / T;
+    for i = 1:T
+        start_idx = floor((i-1)*segment_size)+1;
+        end_idx = min(floor(i*segment_size), frameLength);
+        for n = start_idx:end_idx
+            P(i, x(n)+1, y(n)+1) = P(i, x(n)+1, y(n)+1) + 1;
+        end
+    end
+    P = P / (max(P(:)) + eps); % Normalize
+    pixel_pics(frameIdx, :, :, :) = P;
+    
+    % Store labels and impairments
+    labels(frameIdx) = m;
+    impairments(frameIdx, :) = [m, channelType, snrThisFrame, timingOffset, freqDrift, phaseOffset];
+end
+
+% Stratified split (70/15/15)
+snrValues = impairments(:, 3);
+split = stratifySplit(snrValues, [-10:4:28], [0.7, 0.15, 0.15]);
+
+% Save dataset
+save('ModClassifier_dataset.mat', 'data', 'pixel_pics', 'labels', 'split', 'impairments', 'modTypes', 'fs', '-v7');
+fprintf('Dataset saved with %d frames\n', size(data,1));
+
+% Helper functions (unchanged)
+function M = getModOrder(modType)
+    switch modType
+        case "BPSK", M = 2;
+        case "QPSK", M = 4;
+        case "8PSK", M = 8;
+        case "16QAM", M = 16;
+        case "64QAM", M = 64;
+        case "PAM4", M = 4;
+        case {"GFSK", "CPFSK"}, M = 2;
+        otherwise, M = [];
+    end
+end
+
+function [y, timingOffset, freqDrift, phaseOffset] = applyImpairments(y, fs, maxOffset, maxFreqDrift)
+    % Timing offset (paper uses εTs)
+    timingOffset = randi([-maxOffset, maxOffset]);
+    y = circshift(y, timingOffset);
+    
+    % Frequency drift (paper uses Δf)
+    freqDrift = maxFreqDrift * (2*rand - 1);
+    t = (0:length(y)-1)'/fs;
+    phaseOffset = 2*pi*rand(); % Random phase
+    y = y .* exp(1j * (2*pi*freqDrift*t + phaseOffset));
+end
+
+function split = stratifySplit(snrValues, snrBins, proportions)
+    split = zeros(size(snrValues), 'uint8');
+    for i = 1:length(snrBins)-1
+        binMask = (snrValues >= snrBins(i)) & (snrValues < snrBins(i+1));
+        binIndices = find(binMask);
+        if ~isempty(binIndices)
+            numBin = length(binIndices);
+            randOrder = randperm(numBin);
+            trainEnd = round(proportions(1)*numBin);
+            valEnd = trainEnd + round(proportions(2)*numBin);
+            
+            split(binIndices(randOrder(1:trainEnd))) = 0; % Train
+            split(binIndices(randOrder(trainEnd+1:valEnd))) = 1; % Val
+            split(binIndices(randOrder(valEnd+1:end))) = 2; % Test
+        end
+    end
+end
+
+function modulator = helperModClassGetModulator(modType, sps, fs)
+    switch modType
+        case "BPSK"
+            rrc = rcosdesign(0.35, 4, sps, 'normal');
+            modulator = @(x) filter(rrc, 1, upfirdn(pskmod(x,2), 1, sps));
+        case "QPSK"
+            rrc = rcosdesign(0.35, 4, sps, 'normal');
+            modulator = @(x) filter(rrc, 1, upfirdn(pskmod(x,4,pi/4), 1, sps));
+        case "8PSK"
+            rrc = rcosdesign(0.35, 4, sps, 'normal');
+            modulator = @(x) filter(rrc, 1, upfirdn(pskmod(x,8), 1, sps));
+        case "16QAM"
+            rrc = rcosdesign(0.35, 4, sps, 'normal');
+            modulator = @(x) filter(rrc, 1, upfirdn(qammod(x,16,'UnitAveragePower',true), 1, sps));
+        case "64QAM"
+            rrc = rcosdesign(0.35, 4, sps, 'normal');
+            modulator = @(x) filter(rrc, 1, upfirdn(qammod(x,64,'UnitAveragePower',true), 1, sps));
+        case "PAM4"
+            rrc = rcosdesign(0.35, 4, sps, 'normal');
+            modulator = @(x) filter(rrc, 1, upfirdn(pammod(x,4), 1, sps));
+        case "GFSK"
+            freqSep = fs / 10;
+            gfilt = gaussdesign(0.5, 4, sps);
+            modulator = @(x) filter(gfilt, 1, fskmod(x, 2, freqSep, sps, fs));
+        case "CPFSK"
+            freqSep = fs / 10;
+            modulator = @(x) fskmod(x, 2, freqSep, sps, fs);
+        case "B-FM"
+            modulator = @(x) fmmod(x,15e3,fs,75e3);
+        case "DSB-AM"
+            modulator = @(x) ammod(x,25e3,fs);
+        case "SSB-AM"
+            modulator = @(x) ssbmod(x,25e3,fs);
+        otherwise
+            error("Unknown modulation type: " + modType);
+    end
+end
