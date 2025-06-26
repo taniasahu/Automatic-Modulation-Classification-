@@ -75,6 +75,7 @@ for frameIdx = 1:totalFrames
     % Assign SNR from stratified bins
     binIdx = mod(floor((frameIdx-1) / (totalFrames/length(snrBins))), length(snrBins)-1) + 1;
     snrThisFrame = snrBins(binIdx) + (snrBins(binIdx+1) - snrBins(binIdx)) * rand();
+    % Apply AWGN
     y = awgn(y, snrThisFrame, 'measured');
     
     % Power normalization
